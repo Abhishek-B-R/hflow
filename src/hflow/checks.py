@@ -503,17 +503,18 @@ def _camera_frame_stats_keys(episode: Episode, *, cameras: Sequence[str] | None 
     default parameters.
 
     Per topic: ``message_count`` always; ``expected_frame_count`` and
-    ``frame_deficit_pct`` only when the topic carries at least two messages;
-    the eight decoded-evidence keys always. ``camera_instrument`` and
-    ``camera_measurement_definition`` are the two non-topic keys; they ride
-    inside the per-topic selection, so an episode with no cameras emits
-    nothing at all.
+    ``frame_deficit_pct`` only when the topic carries at least two messages
+    and advancing timestamps; the eight decoded-evidence keys always.
+    ``camera_instrument`` and ``camera_measurement_definition`` are the two
+    non-topic keys; they ride inside the per-topic selection, so an episode
+    with no cameras emits nothing at all.
     """
     selected = _resolve_selected_cameras(episode, cameras)
     keys: set[str] = set()
     for topic in selected:
+        stamps_ns = episode.channel(topic).timestamps
         keys.add(f"{topic}/message_count")
-        if episode.channel(topic).timestamps.size >= 2:
+        if stamps_ns.size >= 2 and np.any(np.diff(stamps_ns) > 0):
             keys.add(f"{topic}/expected_frame_count")
             keys.add(f"{topic}/frame_deficit_pct")
         keys.update(
@@ -546,7 +547,7 @@ class _CameraIntermediates:
 
     stamps_ns: np.ndarray
     stats: VideoFrameStatistics
-    # None below two messages, mirroring the branches that need a rate.
+    # None below two messages or on non-advancing timestamps, mirroring the branches that need a rate.
     expected_frame_count: int | None
 
 
@@ -576,9 +577,16 @@ def _camera_intermediates(
     if stamps_ns.size >= 2:
         deltas_s = np.diff(stamps_ns) / 1e9
         declared_hz = (expected_hz or {}).get(topic)
-        expected_period_s = 1.0 / declared_hz if declared_hz else float(np.median(deltas_s))
-        span_s = float((stamps_ns[-1] - stamps_ns[0]) / 1e9)
-        expected_frame_count = round(span_s / expected_period_s) + 1
+        if declared_hz and declared_hz > 0:
+            expected_period_s = 1.0 / declared_hz
+        else:
+            advancing_deltas_s = deltas_s[deltas_s > 0]
+            expected_period_s = (
+                float(np.median(advancing_deltas_s)) if advancing_deltas_s.size > 0 else None
+            )
+        if expected_period_s is not None and expected_period_s > 0:
+            span_s = max(0.0, float((stamps_ns[-1] - stamps_ns[0]) / 1e9))
+            expected_frame_count = round(span_s / expected_period_s) + 1
     return _CameraIntermediates(stamps_ns, stats, expected_frame_count)
 
 
