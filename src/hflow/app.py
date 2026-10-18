@@ -449,10 +449,17 @@ def _render_contact_sheets(canonical_episode: Episode, media_directory: Path) ->
 
     Each sheet lands at ``<media_directory>/<sanitized_topic>.jpg`` and is
     recorded as an ``artifact/<topic>`` measurement on the
-    ``media/contact_sheet`` step.
+    ``media/contact_sheet`` step. A camera with no messages gets no sheet.
     """
     sheet_artifacts: dict[str, Path] = {}
     for camera_topic in canonical_episode.cameras:
+        if not any(
+            info.message_count > 0
+            for info in canonical_episode.channels.values()
+            if info.topic == camera_topic
+        ):
+            # A declared camera with no messages has no frames to sheet (#528).
+            continue
         frames = canonical_episode.frames(camera_topic, fps=_MEDIA_CONTACT_SHEET_FPS)
         sheet_path = media_directory / f"{_sanitize_topic(camera_topic)}.jpg"
         contact_sheet(frames, sheet_path)

@@ -186,6 +186,118 @@ def test_transform_keeps_a_declared_camera_channel_with_no_messages(tmp_path: Pa
     }
 
 
+def _declare_an_empty_camera(source: Path, output: Path, *, empty_topic: str) -> Path:
+    """Copy ``source`` and declare one more camera channel that records nothing."""
+    with source.open("rb") as source_stream, output.open("wb") as output_stream:
+        reader = make_reader(source_stream)
+        header = reader.get_header()
+        summary = reader.get_summary()
+        assert summary is not None
+        writer = StockWriter(output_stream)
+        writer.start(profile=header.profile, library=header.library)
+        schema_ids = {
+            schema_id: writer.register_schema(
+                name=schema.name, encoding=schema.encoding, data=schema.data
+            )
+            for schema_id, schema in summary.schemas.items()
+        }
+        channel_ids = {
+            channel_id: writer.register_channel(
+                topic=channel.topic,
+                message_encoding=channel.message_encoding,
+                schema_id=schema_ids[channel.schema_id],
+            )
+            for channel_id, channel in summary.channels.items()
+        }
+        camera_channel = next(
+            channel for channel in summary.channels.values() if channel.topic != "/joint_states"
+        )
+        writer.register_channel(
+            topic=empty_topic,
+            message_encoding=camera_channel.message_encoding,
+            schema_id=schema_ids[camera_channel.schema_id],
+        )
+        for _schema, channel, message in reader.iter_messages(log_time_order=True):
+            writer.add_message(
+                channel_ids[channel.id],
+                log_time=message.log_time,
+                data=message.data,
+                publish_time=message.publish_time,
+                sequence=message.sequence,
+            )
+        writer.finish()
+    return output
+
+
+@pytest.mark.requires_system_ffmpeg
+def test_an_empty_camera_does_not_break_the_checks_and_media_of_populated_ones(
+    tmp_path: Path,
+) -> None:
+    """A declared camera with no messages is skipped, not decoded (#528).
+
+    Keeping the empty channel puts it in ``Episode.cameras``, and every
+    consumer that remuxed each camera then asked ffmpeg for a video with no
+    frames: ``camera_frame_stats`` and the contact sheet errored, and the
+    populated camera beside it lost its results with them.
+    """
+    from hflow.app import MEDIA_CONTACT_SHEET_STEP_NAME
+    from hflow.camera_video import CAMERA_VIDEO_VERSION, camera_video, video_artifact_name
+    from hflow.checks import camera_signal_quality
+
+    populated = "/wrist_cam/compressed"
+    empty = "/empty_cam/compressed"
+    source = _declare_an_empty_camera(
+        synthesize_episode(
+            tmp_path / "one-camera.mcap",
+            SyntheticEpisodeSpec(duration_s=2.0, cameras=("wrist_cam",), black_segment=None),
+        ),
+        tmp_path / "with-empty-camera.mcap",
+        empty_topic=empty,
+    )
+    app = hflow.App("empty-camera", data_root=tmp_path / "data")
+    app.check(version="1")(camera_signal_quality)
+    app.enrich(version=CAMERA_VIDEO_VERSION)(camera_video)
+
+    report = asyncio.run(app.test(source, verbose=False))
+
+    with hflow.Episode(report.canonical_path) as episode:
+        assert episode.cameras == [empty, populated]
+    errors = {run.check.name: run.error for run in report.checks if run.error} | {
+        run.enrichment.name: run.error for run in report.enrichments if run.error
+    }
+    assert errors == {}
+    measurements = {
+        run.check.name: run.result.measurements for run in report.checks if run.result is not None
+    }
+
+    frame_stats = measurements["camera_frame_stats"]
+    assert {key for key in frame_stats if key.startswith(f"{empty}/")} == {f"{empty}/message_count"}
+    assert frame_stats[f"{empty}/message_count"] == 0
+    assert cast(int, frame_stats[f"{populated}/decoded_frame_count"]) > 0
+    assert "camera_instrument" in frame_stats
+
+    signal_quality = measurements["camera_signal_quality"]
+    assert {key for key in signal_quality if key.startswith(f"{empty}/")} == {
+        f"{empty}/signal_frame_count"
+    }
+    assert signal_quality[f"{empty}/signal_frame_count"] == 0
+    assert cast(int, signal_quality[f"{populated}/signal_frame_count"]) > 0
+
+    enrichments = {run.enrichment.name: run for run in report.enrichments}
+    video_result = enrichments["camera_video"].result
+    assert video_result is not None
+    assert set(video_result.artifacts) == {video_artifact_name(populated)}
+    assert {key for key in video_result.labels if key.startswith(f"{empty}/")} == {
+        f"{empty}/video_frame_count"
+    }
+    assert video_result.labels[f"{empty}/video_frame_count"] == 0
+    assert cast(int, video_result.labels[f"{populated}/video_frame_count"]) > 0
+
+    sheet_result = enrichments[MEDIA_CONTACT_SHEET_STEP_NAME].result
+    assert sheet_result is not None
+    assert set(sheet_result.artifacts) == {populated}
+
+
 def test_transform_rejects_nonconforming_passthrough_video(tmp_path: Path) -> None:
     source = tmp_path / "h265.mcap"
     write_compressed_video_mcap(

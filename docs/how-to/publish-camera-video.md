@@ -45,6 +45,10 @@ callers needing exact per-frame times read the message timestamps.
 which case `Episode.time_bounds` is `None` and the catalog row carries NULL
 `start_ns`/`end_ns`.
 
+A declared camera topic with no messages has nothing to mux, so it gets only
+`<topic>/video_frame_count` of 0: no artifact, no `video_fps`, and no
+`video_start_s`.
+
 ## 3. Play it next to the evidence
 
 `hflow serve` serves every cataloged artifact by name, so the MP4 streams

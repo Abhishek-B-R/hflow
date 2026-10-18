@@ -165,7 +165,8 @@ query later rather than pass/fail decisions baked into your corpus.
 
 For `camera_frame_stats`, an empty camera topic reports only
 `{topic}/message_count=0`; no video statistics or instrument provenance are
-emitted unless a selected camera has messages.
+emitted unless a selected camera has messages. `camera_signal_quality` does the
+same with `{topic}/signal_frame_count=0`.
 
 Three need a topic or a rate you have to supply: `required_topics` and
 `action_rate` take `topics=`, and `camera_fps_conformance` needs `nominal_fps=`
