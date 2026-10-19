@@ -29,8 +29,15 @@ from mcap_test_helpers import (
 import hflow
 from hflow import transform
 from hflow._grouped_mcap_writer import NO_SCHEMA_ID, GroupedMcapWriter
+from hflow.catalog import content_episode_id
+from hflow.checks import required_topics
 from hflow.doctor import diagnose
-from hflow.format import METADATA_RECORD_EPISODE, METADATA_RECORD_PROVENANCE
+from hflow.format import (
+    FFMPEG_VERSION_NOT_USED,
+    METADATA_RECORD_EPISODE,
+    METADATA_RECORD_PROVENANCE,
+    PROVENANCE_KEY_TOPIC_GROUP_PREFIX,
+)
 from hflow.reader import TopicInfo
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import SourceNotConforming, write_canonical_episode
@@ -94,6 +101,201 @@ def test_transform_preserves_no_schema_sentinel_and_empty_episode_record(
         assert channel.schema_id == 0
         record_names = [record.name for record in reader.iter_metadata()]
     assert METADATA_RECORD_EPISODE in record_names
+
+
+def _write_status_source(path: Path, *, declare_empty_camera: bool) -> Path:
+    from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
+    from mcap_protobuf.schema import build_file_descriptor_set
+
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        if declare_empty_camera:
+            image_schema_id = writer.register_schema(
+                name="foxglove.CompressedImage",
+                encoding="protobuf",
+                data=build_file_descriptor_set(CompressedImage).SerializeToString(),
+            )
+            writer.register_channel(
+                topic="/cam", message_encoding="protobuf", schema_id=image_schema_id
+            )
+        status_channel_id = writer.register_channel(
+            topic="/status", message_encoding="json", schema_id=0
+        )
+        for index in range(3):
+            writer.add_message(
+                status_channel_id,
+                log_time=index * 10**9,
+                data=json.dumps({"index": index}).encode(),
+                publish_time=index * 10**9,
+            )
+        writer.finish()
+    return path
+
+
+def test_transform_keeps_a_declared_camera_channel_with_no_messages(tmp_path: Path) -> None:
+    """A camera that recorded nothing is still a declared channel (#528).
+
+    Dropping it made the canonical byte-identical to a source that never
+    declared the camera, so both got one episode_id, and provenance still
+    named the camera's topic group with no channel behind it.
+    """
+    with_camera = tmp_path / "with-camera.mcap"
+    without_camera = tmp_path / "without-camera.mcap"
+    write_canonical_episode(
+        _write_status_source(tmp_path / "with-camera-source.mcap", declare_empty_camera=True),
+        with_camera,
+    )
+    write_canonical_episode(
+        _write_status_source(tmp_path / "without-camera-source.mcap", declare_empty_camera=False),
+        without_camera,
+    )
+
+    assert content_episode_id(with_camera) != content_episode_id(without_camera)
+
+    with with_camera.open("rb") as stream:
+        reader = make_reader(stream)
+        summary = reader.get_summary()
+        assert summary is not None
+        assert summary.statistics is not None
+        channels_by_topic = {channel.topic: channel for channel in summary.channels.values()}
+        assert set(channels_by_topic) == {"/cam", "/status"}
+        camera_channel = channels_by_topic["/cam"]
+        assert summary.schemas[camera_channel.schema_id].name == "foxglove.CompressedVideo"
+        assert summary.statistics.channel_message_counts.get(camera_channel.id, 0) == 0
+        provenance = next(
+            record.metadata
+            for record in reader.iter_metadata()
+            if record.name == METADATA_RECORD_PROVENANCE
+        )
+    grouped_topics = {
+        key.removeprefix(PROVENANCE_KEY_TOPIC_GROUP_PREFIX)
+        for key in provenance
+        if key.startswith(PROVENANCE_KEY_TOPIC_GROUP_PREFIX)
+    }
+    assert grouped_topics == set(channels_by_topic)
+    # Nothing was transcoded, so ffmpeg is still not an instrument here.
+    assert provenance["ffmpeg_version"] == FFMPEG_VERSION_NOT_USED
+
+    with hflow.Episode(with_camera) as episode:
+        result = asyncio.run(required_topics(episode, topics=["/cam"]))
+    assert result.measurements == {
+        "/cam/present": True,
+        "/cam/message_count": 0,
+        "missing_topic_count": 0,
+    }
+
+
+def _declare_an_empty_camera(source: Path, output: Path, *, empty_topic: str) -> Path:
+    """Copy ``source`` and declare one more camera channel that records nothing."""
+    with source.open("rb") as source_stream, output.open("wb") as output_stream:
+        reader = make_reader(source_stream)
+        header = reader.get_header()
+        summary = reader.get_summary()
+        assert summary is not None
+        writer = StockWriter(output_stream)
+        writer.start(profile=header.profile, library=header.library)
+        schema_ids = {
+            schema_id: writer.register_schema(
+                name=schema.name, encoding=schema.encoding, data=schema.data
+            )
+            for schema_id, schema in summary.schemas.items()
+        }
+        channel_ids = {
+            channel_id: writer.register_channel(
+                topic=channel.topic,
+                message_encoding=channel.message_encoding,
+                schema_id=schema_ids[channel.schema_id],
+            )
+            for channel_id, channel in summary.channels.items()
+        }
+        camera_channel = next(
+            channel for channel in summary.channels.values() if channel.topic != "/joint_states"
+        )
+        writer.register_channel(
+            topic=empty_topic,
+            message_encoding=camera_channel.message_encoding,
+            schema_id=schema_ids[camera_channel.schema_id],
+        )
+        for _schema, channel, message in reader.iter_messages(log_time_order=True):
+            writer.add_message(
+                channel_ids[channel.id],
+                log_time=message.log_time,
+                data=message.data,
+                publish_time=message.publish_time,
+                sequence=message.sequence,
+            )
+        writer.finish()
+    return output
+
+
+@pytest.mark.requires_system_ffmpeg
+def test_an_empty_camera_does_not_break_the_checks_and_media_of_populated_ones(
+    tmp_path: Path,
+) -> None:
+    """A declared camera with no messages is skipped, not decoded (#528).
+
+    Keeping the empty channel puts it in ``Episode.cameras``, and every
+    consumer that remuxed each camera then asked ffmpeg for a video with no
+    frames: ``camera_frame_stats`` and the contact sheet errored, and the
+    populated camera beside it lost its results with them.
+    """
+    from hflow.app import MEDIA_CONTACT_SHEET_STEP_NAME
+    from hflow.camera_video import CAMERA_VIDEO_VERSION, camera_video, video_artifact_name
+    from hflow.checks import camera_signal_quality
+
+    populated = "/wrist_cam/compressed"
+    empty = "/empty_cam/compressed"
+    source = _declare_an_empty_camera(
+        synthesize_episode(
+            tmp_path / "one-camera.mcap",
+            SyntheticEpisodeSpec(duration_s=2.0, cameras=("wrist_cam",), black_segment=None),
+        ),
+        tmp_path / "with-empty-camera.mcap",
+        empty_topic=empty,
+    )
+    app = hflow.App("empty-camera", data_root=tmp_path / "data")
+    app.check(version="1")(camera_signal_quality)
+    app.enrich(version=CAMERA_VIDEO_VERSION)(camera_video)
+
+    report = asyncio.run(app.test(source, verbose=False))
+
+    with hflow.Episode(report.canonical_path) as episode:
+        assert episode.cameras == [empty, populated]
+    errors = {run.check.name: run.error for run in report.checks if run.error} | {
+        run.enrichment.name: run.error for run in report.enrichments if run.error
+    }
+    assert errors == {}
+    measurements = {
+        run.check.name: run.result.measurements for run in report.checks if run.result is not None
+    }
+
+    frame_stats = measurements["camera_frame_stats"]
+    assert {key for key in frame_stats if key.startswith(f"{empty}/")} == {f"{empty}/message_count"}
+    assert frame_stats[f"{empty}/message_count"] == 0
+    assert cast(int, frame_stats[f"{populated}/decoded_frame_count"]) > 0
+    assert "camera_instrument" in frame_stats
+
+    signal_quality = measurements["camera_signal_quality"]
+    assert {key for key in signal_quality if key.startswith(f"{empty}/")} == {
+        f"{empty}/signal_frame_count"
+    }
+    assert signal_quality[f"{empty}/signal_frame_count"] == 0
+    assert cast(int, signal_quality[f"{populated}/signal_frame_count"]) > 0
+
+    enrichments = {run.enrichment.name: run for run in report.enrichments}
+    video_result = enrichments["camera_video"].result
+    assert video_result is not None
+    assert set(video_result.artifacts) == {video_artifact_name(populated)}
+    assert {key for key in video_result.labels if key.startswith(f"{empty}/")} == {
+        f"{empty}/video_frame_count"
+    }
+    assert video_result.labels[f"{empty}/video_frame_count"] == 0
+    assert cast(int, video_result.labels[f"{populated}/video_frame_count"]) > 0
+
+    sheet_result = enrichments[MEDIA_CONTACT_SHEET_STEP_NAME].result
+    assert sheet_result is not None
+    assert set(sheet_result.artifacts) == {populated}
 
 
 def test_transform_rejects_nonconforming_passthrough_video(tmp_path: Path) -> None:

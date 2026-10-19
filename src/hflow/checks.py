@@ -890,6 +890,16 @@ def _timestamp_regularity_resolve_selected(
     return selected, state_topics
 
 
+def _camera_has_messages(episode: Episode, topic: str) -> bool:
+    """Whether a camera topic recorded anything, from the summary statistics.
+
+    A declared camera channel can be empty (#528), and there is no video to
+    remux for it. Read from the channel summary so asking costs no payload
+    read for the populated cameras that are about to be decoded anyway.
+    """
+    return any(info.message_count > 0 for info in episode.channels.values() if info.topic == topic)
+
+
 def _resolve_selected_cameras(episode: Episode, cameras: Sequence[str] | None) -> list[str]:
     """The cameras a check ran over: the caller's list, or every camera.
 
@@ -1688,6 +1698,11 @@ def _measure_camera_signal_quality(
     selected_cameras = _resolve_selected_cameras(episode, cameras)
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
+        if not _camera_has_messages(episode, topic):
+            # A declared camera with no messages has no video to decode, so
+            # it reports the zero count and withholds the readings (#528).
+            measurements[f"{topic}/signal_frame_count"] = 0
+            continue
         frame_statistics = measure_video_frame_statistics_for_hflow(
             episode.video(topic),
             settings=FrameStatisticsSettings(

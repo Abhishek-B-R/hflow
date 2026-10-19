@@ -27,6 +27,9 @@ Per camera topic it records:
   (the stream's median frame interval), which is what video time counts in;
 - label ``<topic>/video_frame_count``: how many access units were muxed.
 
+A declared camera with no messages gets only ``<topic>/video_frame_count`` of
+0: no MP4 artifact, no ``video_fps``, and no ``video_start_s``.
+
 The MP4 plays at a constant rate, so a stream with irregular stamps drifts
 from log time by its jitter; the ``timestamp_regularity`` check measures that
 jitter, and callers needing exact per-frame times read the message stamps.
@@ -66,8 +69,13 @@ def camera_video(episode: Episode) -> EnrichmentResult:
     artifacts: dict[str, Path] = {}
     time_bounds = episode.time_bounds
     for camera_topic in episode.cameras:
-        mp4_path = episode.video(camera_topic)
         channel = episode.channel(camera_topic)
+        if len(channel) == 0:
+            # A declared camera with no messages has nothing to mux (#528):
+            # record the zero count and publish no video for it.
+            labels[f"{camera_topic}/video_frame_count"] = 0
+            continue
+        mp4_path = episode.video(camera_topic)
         artifacts[video_artifact_name(camera_topic)] = mp4_path
         # The same estimate Episode.video() muxed at, so the label is the
         # file's actual clock.
