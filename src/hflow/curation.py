@@ -710,6 +710,19 @@ def _reject_tenant_sql(sql: str) -> None:
         raise ValueError("sql must be exactly one SELECT statement") from exc
 
 
+def _tenant_relation_sql(sql: str) -> str:
+    """Validate a query and remove its optional trailing statement terminator."""
+    _reject_tenant_sql(sql)
+    tokens = duckdb.tokenize(sql)
+    non_comment_tokens = [token for token in tokens if token[1] != duckdb.token_type.comment]
+    if non_comment_tokens:
+        position, _token_type = non_comment_tokens[-1]
+        sql_bytes = sql.encode("utf-8")
+        if sql_bytes[position : position + 1] == b";":
+            return (sql_bytes[:position] + sql_bytes[position + 1 :]).decode("utf-8")
+    return sql
+
+
 def _stage_manifest_and_count(
     connection: duckdb.DuckDBPyConnection, sql: str, staged_manifest: Path
 ) -> int:
@@ -720,16 +733,13 @@ def _stage_manifest_and_count(
     **without executing it** and refuses any payload that is not exactly one
     SELECT statement — including multi-statement injections separated by
     semicolons (e.g. ``SELECT ...; CREATE TABLE pwned AS SELECT ...``) and
-    DDL-only input. ``connection.sql()`` is **not** the guard: on duckdb
-    1.5.5 it silently executes all statements and returns ``None`` for
-    multi-statement input. ``write_parquet`` then materialises the single
-    confirmed-safe relation to the staged path.
+    DDL-only input. ``connection.sql()`` is not the guard. ``write_parquet``
+    materialises the single confirmed-safe relation to the staged path.
 
     The row-count query only ever receives an internally-generated path,
     so it keeps the existing f-string form.
     """
-    _reject_tenant_sql(sql)
-    connection.sql(sql).write_parquet(str(staged_manifest))
+    connection.sql(_tenant_relation_sql(sql)).write_parquet(str(staged_manifest))
 
     (row_count,) = connection.execute(
         f"SELECT count(*) FROM read_parquet({_quote_sql_string(str(staged_manifest))})"
@@ -745,9 +755,7 @@ def _collect_coverage(connection: duckdb.DuckDBPyConnection) -> tuple[int, list[
     # a corpus that does not exist. Coverage is the honesty feature (a
     # statistic over half a delivery must not look like a statistic over all
     # of it), so it is the last place to count a stale denominator.
-    (total_episodes,) = connection.execute("SELECT count(*) FROM episodes_latest").fetchone() or (
-        0,
-    )
+    (total_episodes,) = connection.execute("SELECT count(*) FROM episodes_latest").fetchall()[0]
     if total_episodes == 0:
         return 0, []
     status_list = ", ".join(_quote_sql_string(status) for status in _RAN_STATUSES)
@@ -918,8 +926,9 @@ def curate(
                 staged_manifest.replace(final_path)
                 manifest_path = final_path
             case None:
-                _reject_tenant_sql(sql)
-                (row_count,) = connection.sql(sql).aggregate("count(*)").fetchone() or (0,)
+                (row_count,) = (
+                    connection.sql(_tenant_relation_sql(sql)).aggregate("count(*)").fetchall()[0]
+                )
                 manifest_path = None
 
         return CurationReport(

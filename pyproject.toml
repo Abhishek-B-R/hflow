@@ -21,8 +21,7 @@ keywords = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    # DuckDB 2 changes relation parsing and result lifetimes used by curation.
-    "duckdb>=1.5.5,<2",
+    "duckdb>=2.0.0",
     "foxglove-schemas-protobuf>=0.4.0",
     "httpx>=0.28.1,<1",
     "httpx2>=2.12.0",

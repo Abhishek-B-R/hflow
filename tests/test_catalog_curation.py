@@ -1368,6 +1368,18 @@ _SQL_SURFACE_PAYLOADS = [
         1,
         id="terminated-select-with-comment",
     ),
+    pytest.param(
+        "SELECT episode_id, ';' AS punctuation FROM episodes; /* end ; */",
+        False,
+        1,
+        id="semicolon-in-string-and-comment",
+    ),
+    pytest.param(
+        "SELECT episode_id, '🤖;' AS label FROM episodes; -- end",
+        False,
+        1,
+        id="unicode-before-terminator",
+    ),
     pytest.param("TABLE episodes", False, 1, id="table-episodes"),
     pytest.param(
         "WITH picked AS (SELECT episode_id FROM episodes) SELECT * FROM picked",
